@@ -170,12 +170,45 @@ var unsafeHeader = [ 'Accept-Charset',
 'User-Agent',
 'Via' ];
 /*==============common end=================*/
-var connect = chrome.runtime.connect({ name: "request" });
+var connect;
+var isContextValid = true;
+
+function initConnection() {
+    try {
+        connect = chrome.runtime.connect({ name: "request" });
+        
+        connect.onDisconnect.addListener(function() {
+            console.warn('Chrome extension context disconnected');
+            isContextValid = false;
+            // 尝试重新连接
+            setTimeout(initConnection, 1000);
+        });
+        
+        connect.onMessage.addListener(function (msg) {
+            var id = msg.id;
+            var res = msg.res;
+            res.status === 200 ?
+                successFns[id](res) :
+                errorFns[id](res);
+            delete successFns[id];
+            delete errorFns[id];
+        });
+        
+        isContextValid = true;
+        console.log('Chrome extension connection established');
+    } catch (error) {
+        console.error('Failed to establish chrome extension connection:', error);
+        isContextValid = false;
+    }
+}
+
+// 初始化连接
+initConnection();
 
 function injectJs(path) {
     var s = document.createElement('script');
     // TODO: add "script.js" to web_accessible_resources in manifest.json
-    s.src = chrome.extension.getURL(path);
+    s.src = chrome.runtime.getURL(path);
     s.onload = function () {
         this.remove();
     };
@@ -340,23 +373,27 @@ function sendAjaxByContent(req, successFn, errorFn) {
 }
 
 function sendAjaxByBack(id, req, successFn, errorFn) {
-    successFns[id] = successFn;
-    errorFns[id] = errorFn;
-    connect.postMessage({
-        id: id,
-        req: req
-    });
+    if (!isContextValid || !connect) {
+        console.warn('Extension context invalid, falling back to content script method');
+        sendAjaxByContent(req, successFn, errorFn);
+        return;
+    }
+    
+    try {
+        successFns[id] = successFn;
+        errorFns[id] = errorFn;
+        connect.postMessage({
+            id: id,
+            req: req
+        });
+    } catch (error) {
+        console.error('Failed to send message via background:', error);
+        // 回退到内容脚本方法
+        delete successFns[id];
+        delete errorFns[id];
+        sendAjaxByContent(req, successFn, errorFn);
+    }
 }
-
-connect.onMessage.addListener(function (msg) {
-    var id = msg.id;
-    var res = msg.res;
-    res.status === 200 ?
-        successFns[id](res) :
-        errorFns[id](res);
-    delete successFns[id];
-    delete errorFns[id];
-});
 
 function checkFileRequest(req) {
     if (req.files && typeof req.files === 'object' && Object.keys(req.files).length > 0) {
@@ -366,8 +403,14 @@ function checkFileRequest(req) {
 }
 
 function run() {
+    if (!isContextValid) {
+        console.warn('Extension context invalid, skipping request processing');
+        return;
+    }
+    
     var reqsDom = yRequestDom.childNodes;
     if (!reqsDom || reqsDom.length === 0) return;
+    
     reqsDom.forEach(function (dom) {
         try {
             var status = dom.getAttribute("status"), request;
@@ -384,48 +427,55 @@ function run() {
                 }, function (err) {
                     responseCallback(err, dom, data);
                 })
-
-                // if (location.protocol.indexOf('https') === 0 && req.url.indexOf('https') !== 0) {
-                //     sendAjaxByBack(id, req, function (res) {                        
-                //         responseCallback(res, dom, data);
-                //     }, function (err) {
-                //         responseCallback(err, dom, data);
-                //     })
-                // } else {
-                //     sendAjaxByContent(req, function (res) {
-                //         responseCallback(res, dom, data);
-                //     }, function (err) {
-                //         responseCallback(err, dom, data);
-                //     })
-                // }
-                
-
             }
         } catch (error) {
-            console.error(error)
-            dom.parentNode.removeChild(dom)
+            console.error('Error processing request:', error);
+            dom.parentNode.removeChild(dom);
         }
-
-    })
+    });
 }
 
 //因注入 index.js ，需要等到 indexScript 初始化完成后执行
+var runInterval;
+
 var findDom = setInterval(function () {
     try {
         yRequestDom = document.getElementById(container);
         if (yRequestDom) {
-            clearInterval(findDom)
+            clearInterval(findDom);
             yRequestDom.setAttribute('key', 'yapi');
-            setInterval(function () {
-                run()
-            }, 100)
+            
+            // 清理之前的定时器
+            if (runInterval) {
+                clearInterval(runInterval);
+            }
+            
+            runInterval = setInterval(function () {
+                try {
+                    run();
+                } catch (error) {
+                    console.error('Error in run interval:', error);
+                    // 如果是上下文失效错误，停止定时器
+                    if (error.message.includes('Extension context invalidated')) {
+                        clearInterval(runInterval);
+                        isContextValid = false;
+                    }
+                }
+            }, 100);
         }
-
     } catch (e) {
-        clearInterval(findDom)
-        console.error(e)
+        clearInterval(findDom);
+        console.error('Error finding DOM:', e);
     }
-}, 100)
+}, 100);
+
+// 页面卸载时清理资源
+window.addEventListener('beforeunload', function() {
+    if (runInterval) {
+        clearInterval(runInterval);
+    }
+    isContextValid = false;
+});
 
 
 

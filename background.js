@@ -192,110 +192,146 @@ function handleHeader(headers) {
 }
 
 chrome.runtime.onMessage.addListener(function (request, _, cb) {
-	var data;
+    var data;
 
-	if (request.action === 'get') {
-		data = localStorage.getItem(request.name);
-		if (typeof cb === 'function') {
-			cb(data)
-		}
-	} else if (request.action === 'set') {
-		localStorage.setItem(request.name, request.value);
-		var newdata = data = localStorage.getItem(request.name);
-	}
-})
+    if (request.action === 'get') {
+        chrome.storage.local.get([request.name], function(result) {
+            if (typeof cb === 'function') {
+                cb(result[request.name] || null);
+            }
+        });
+        return true; // 保持消息通道开放
+    } else if (request.action === 'set') {
+        var obj = {};
+        obj[request.name] = request.value;
+        chrome.storage.local.set(obj, function() {
+            if (typeof cb === 'function') {
+                cb(request.value);
+            }
+        });
+        return true; // 保持消息通道开放
+    }
+});
 
 function sendAjax(req, successFn, errorFn) {
-	var formDatas;
-	var xhr = new XMLHttpRequest();
+    var formDatas;
+    
+    req.headers = req.headers || {};
+    req.headers['Content-Type'] = req.headers['Content-Type'] || req.headers['Content-type'] || req.headers['content-type'];// 兼容多种写法
 
-	req.headers = req.headers || {};
-	req.headers['Content-Type'] = req.headers['Content-Type'] || req.headers['Content-type'] || req.headers['content-type'];// 兼容多种写法
+    var timeout = req.timeout || 1000000;
 
-	xhr.timeout = req.timeout || 1000000;
+    req.method = req.method || 'GET';
+    req.headers = req.headers || {};
 
-	req.method = req.method || 'GET';
-	req.async = req.async === false ? false : true;
-	req.headers = req.headers || {};
+    if (req.method.toLowerCase() !== 'get' && req.method.toLowerCase() !== 'head' && req.method.toLowerCase() !== 'options') {
+        if (!req.headers['Content-Type'] || req.headers['Content-Type'].startsWith('application/x-www-form-urlencoded')) {
+            req.headers['Content-Type'] = req.headers['Content-Type'] || 'application/x-www-form-urlencoded';
+            req.data = formUrlencode(req.data);
+        } else if (typeof req.data === 'object' && req.data) {
+            req.data = JSON.stringify(req.data);
+        }
+    } else {
+        delete req.headers['Content-Type'];
+    }
+    
+    if (req.query && typeof req.query === 'object') {
+        var getUrl = formUrlencode(req.query);
+        req.url = req.url + '?' + getUrl;
+        req.query = '';
+    }
 
-	if (req.method.toLowerCase() !== 'get' && req.method.toLowerCase() !== 'head' && req.method.toLowerCase() !== 'options') {
-		if (!req.headers['Content-Type'] || req.headers['Content-Type'].startsWith('application/x-www-form-urlencoded')) {
-			req.headers['Content-Type'] = req.headers['Content-Type'] || 'application/x-www-form-urlencoded';
-			req.data = formUrlencode(req.data);
-		} else if (typeof req.data === 'object' && req.data) {
-			req.data = JSON.stringify(req.data);
-		}
-	}else{
-    delete req.headers['Content-Type'];
-  }
-	if (req.query && typeof req.query === 'object') {
-		var getUrl = formUrlencode(req.query);
-		req.url = req.url + '?' + getUrl;
-		req.query = '';
-	}
-	xhr.open(req.method, req.url, req.async);
-	var response = {};
-	if (req.headers) {
-		var unsafeHeaderArr = [];
-		for (var name in req.headers) {
-			if (unsafeHeader.indexOf(name) > -1) {
-				unsafeHeaderArr.push({
-					name: name,
-					value: req.headers[name]
-				})
-			} else {
-				xhr.setRequestHeader(name, req.headers[name]);
-			}
-		}
-		if (unsafeHeaderArr.length > 0) {
-			xhr.setRequestHeader('cross-request-unsafe-headers-list', encode(unsafeHeaderArr));
-		}
-	}
+    // 处理不安全的headers
+    var unsafeHeaderArr = [];
+    var safeHeaders = {};
+    
+    if (req.headers) {
+        for (var name in req.headers) {
+            if (unsafeHeader.indexOf(name) > -1) {
+                unsafeHeaderArr.push({
+                    name: name,
+                    value: req.headers[name]
+                });
+            } else {
+                safeHeaders[name] = req.headers[name];
+            }
+        }
+        if (unsafeHeaderArr.length > 0) {
+            safeHeaders['cross-request-unsafe-headers-list'] = encode(unsafeHeaderArr);
+        }
+    }
 
-	xhr.setRequestHeader('cross-request-open-sign', '1')
+    safeHeaders['cross-request-open-sign'] = '1';
 
-	xhr.onload = function (e) {
-		var headers = xhr.getAllResponseHeaders();
-		headers = handleHeader(headers);
-		var newHeaders;
-		if(headers['cross-response-unsafe-headers-list']){
-			newHeaders = decode(headers['cross-response-unsafe-headers-list'])
-			delete headers['cross-response-unsafe-headers-list'];
-			if(newHeaders && typeof newHeaders === 'object' && Object.keys(newHeaders).length > 0){
-					headers = newHeaders;
-			}
-		}
-		response = {
-			headers: headers,
-			status: xhr.status,
-			statusText: xhr.statusText,
-			body: xhr.responseText
-		}
-		if (xhr.status == 200) {
-			successFn(response);
-		} else {
-			errorFn(response);
-		}
-	};
-	xhr.ontimeout = function (e) {
-		errorFn({
-			body: 'Error:Request timeout that the time is ' + xhr.timeout
-		})
-	};
-	xhr.onerror = function (e) {
-		errorFn({
-			body: xhr.statusText
-		})
-	};
-	xhr.upload.onprogress = function (e) { };
+    // 创建 fetch 选项
+    var fetchOptions = {
+        method: req.method,
+        headers: safeHeaders
+    };
 
-	try {
-		xhr.send(req.data);
-	} catch (error) {
-		errorFn({
-			body: error.message
-		})
-	}
+    // 添加请求体（如果有的话）
+    if (req.data && req.method.toLowerCase() !== 'get' && req.method.toLowerCase() !== 'head') {
+        fetchOptions.body = req.data;
+    }
+
+    // 创建超时控制
+    var controller = new AbortController();
+    var timeoutId = setTimeout(() => {
+        controller.abort();
+    }, timeout);
+
+    fetchOptions.signal = controller.signal;
+
+    // 发送请求
+    fetch(req.url, fetchOptions)
+        .then(function(response) {
+            clearTimeout(timeoutId);
+            
+            // 获取响应头
+            var headers = {};
+            response.headers.forEach(function(value, name) {
+                headers[name] = value;
+            });
+
+            // 处理不安全的响应头
+            var newHeaders;
+            if (headers['cross-response-unsafe-headers-list']) {
+                newHeaders = decode(headers['cross-response-unsafe-headers-list']);
+                delete headers['cross-response-unsafe-headers-list'];
+                if (newHeaders && typeof newHeaders === 'object' && Object.keys(newHeaders).length > 0) {
+                    headers = newHeaders;
+                }
+            }
+
+            // 读取响应体
+            return response.text().then(function(body) {
+                var responseObj = {
+                    headers: headers,
+                    status: response.status,
+                    statusText: response.statusText,
+                    body: body
+                };
+
+                if (response.status === 200) {
+                    successFn(responseObj);
+                } else {
+                    errorFn(responseObj);
+                }
+            });
+        })
+        .catch(function(error) {
+            clearTimeout(timeoutId);
+            
+            if (error.name === 'AbortError') {
+                errorFn({
+                    body: 'Error:Request timeout that the time is ' + timeout
+                });
+            } else {
+                errorFn({
+                    body: error.message
+                });
+            }
+        });
 }
 
 chrome.runtime.onConnect.addListener(function (connect) {
@@ -334,54 +370,49 @@ function ensureItem(arr, name, value) {
 	return arr;
 }
 
- function responseListener(details) {
-	if (requestBatch[details.requestId] === true) {
-		delete requestBatch[details.requestId];
-		var unsafeHeaderArr = { cookie: [] };
-		var cookie = unsafeHeaderArr.cookie;
-		details.responseHeaders.forEach(function (item) {
-			if (item.name === 'Set-Cookie') {
-				cookie.push(item.value)
-			}
-			else {
-				unsafeHeaderArr[item.name] = item.value;
-			}
-		})
-		details.responseHeaders.push({
-			name: 'cross-response-unsafe-headers-list',
-			value: encode(unsafeHeaderArr)
-		})
-	}
-	return { responseHeaders: details.responseHeaders }
-
+function responseListener(details) {
+    if (requestBatch[details.requestId] === true) {
+        delete requestBatch[details.requestId];
+        var unsafeHeaderArr = { cookie: [] };
+        var cookie = unsafeHeaderArr.cookie;
+        details.responseHeaders.forEach(function (item) {
+            if (item.name === 'Set-Cookie') {
+                cookie.push(item.value)
+            }
+            else {
+                unsafeHeaderArr[item.name] = item.value;
+            }
+        })
+        // 注意：非阻塞模式下不能修改响应头
+        // 需要通过其他方式传递这些信息
+        chrome.runtime.sendMessage({
+            action: 'unsafe-headers',
+            requestId: details.requestId,
+            headers: unsafeHeaderArr
+        }).catch(() => {}); // 忽略错误
+    }
 }
 
-function requestListener (details) {
-	var find = false;
-	details.requestHeaders.forEach(function (item, index) {
-		if (item.name === 'cross-request-open-sign' && item.value == '1') {
-			requestBatch[details.requestId] = true;
-		}
-		if (item.name === 'cross-request-unsafe-headers-list') {
-			var val = decode(item.value);
-			val.forEach(function (v) {
-				details.requestHeaders = ensureItem(details.requestHeaders, v.name, v.value)
-			})
-		}
-	})
-
-	return { requestHeaders: details.requestHeaders };
+function requestListener(details) {
+    details.requestHeaders.forEach(function (item) {
+        if (item.name === 'cross-request-open-sign' && item.value == '1') {
+            requestBatch[details.requestId] = true;
+        }
+    });
 }
 
-chrome.webRequest.onHeadersReceived.removeListener(responseListener);
-chrome.webRequest.onBeforeSendHeaders.removeListener(requestListener);
+// 使用非阻塞的 webRequest API
+if (chrome.webRequest && chrome.webRequest.onHeadersReceived) {
+    chrome.webRequest.onHeadersReceived.removeListener(responseListener);
+    chrome.webRequest.onBeforeSendHeaders.removeListener(requestListener);
 
-chrome.webRequest.onHeadersReceived.addListener(responseListener, {
-		urls: ["<all_urls>"]
-	}, ['blocking', 'responseHeaders', 'extraHeaders']);
+    // 移除 'blocking' 参数，只保留监听功能
+    chrome.webRequest.onHeadersReceived.addListener(responseListener, {
+        urls: ["<all_urls>"]
+    }, ['responseHeaders', 'extraHeaders']);
 
-chrome.webRequest.onBeforeSendHeaders.addListener(requestListener, {
-		urls: ["<all_urls>"]
-	}, ['blocking', 'requestHeaders', 'extraHeaders']);
-
+    chrome.webRequest.onBeforeSendHeaders.addListener(requestListener, {
+        urls: ["<all_urls>"]
+    }, ['requestHeaders', 'extraHeaders']);
+}
 
